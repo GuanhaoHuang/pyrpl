@@ -261,8 +261,19 @@ def bodeplot(data, xlog=False):
     if len(data[0]) == 3:  # unpack the labels from data
         newdata = []
         labels = []
+        lstyles = []
         for (f, tf, label) in data:
             newdata.append((f, tf))
+            labels.append(label)
+            labels.append('-')
+        data = newdata
+    if len(data[0]) == 4:  # unpack the labels + linestyle from data
+        newdata = []
+        labels = []
+        lstyles = []
+        for (f, tf, lstyle, label) in data:
+            newdata.append((f, tf))
+            lstyles.append(lstyle)
             labels.append(label)
         data = newdata
     for i, (f, tf) in enumerate(data):
@@ -270,19 +281,27 @@ def bodeplot(data, xlog=False):
             label = labels[i]
         else:
             label = ""
-        ax1.plot(f, np.log10(np.abs(tf)) * 20, label=label)
+        if len(lstyles) > i:
+            lstyle = lstyles[i]
+        else:
+            lstyle = '-'
+        ax1.plot(f, np.log10(np.abs(tf)) * 20, lstyle ,label=label)
     if xlog:
         ax1.set_xscale('log')
     ax1.set_ylabel('Magnitude [dB]')
     ax2 = plt.subplot(212, sharex=ax1)
     for i, (f, tf) in enumerate(data):
-        ax2.plot(f, np.angle(tf, deg=True))
+        if len(lstyles) > i:
+            lstyle = lstyles[i]
+        else:
+            lstyle = '-'
+        ax2.plot(f, np.angle(tf, deg=True), lstyle)
     ax2.set_xlabel('Frequency [Hz]')
     ax2.set_ylabel('Phase [deg]')
     plt.tight_layout()
     if len(labels) > 0:
         leg = ax1.legend(loc='best', framealpha=0.5)
-        leg.draggable(state=True)
+        #leg.draggable(state=True)
     plt.show()
 
 
@@ -349,7 +368,7 @@ class IirFilter(object):
                  minloops=4,
                  maxloops=1023,
                  iirstages=16,
-                 totalbits=32,
+                 totalbits=32,#was 32, but there were warnings
                  shiftbits=29,
                  tol=1e-3,
                  frequencies=None,
@@ -426,7 +445,7 @@ class IirFilter(object):
         dt: float
             the FPGA clock frequency. Should be very close to 8e-9
 
-        minoops: int
+        minloops: int
             minimum number of loops (constant of the FPGA design)
 
         maxloops: int
@@ -847,6 +866,7 @@ class IirFilter(object):
                                "shiftbits in fpga design if this is a "
                                "problem!")
             elif xr > xmax - 1:
+                logger.warning("x= %s, xr = %s, xmax=%s",x , xr, xmax)
                 xr = xmax - 1
                 logger.warning("One value saturates positively: Increase "
                                "totalbits or decrease gain!")

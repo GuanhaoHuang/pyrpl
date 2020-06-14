@@ -15,6 +15,91 @@
 #    You should have received a copy of the GNU General Public License
 #    along with this program.  If not, see <http://www.gnu.org/licenses/>.
 ###############################################################################
+"""
+The spectrum analyzer measures the magnitude of an input signal versus
+frequency. There are two working modes for the spectrum analyzer implemented in
+pyrpl:
+
+- iq mode: the input signal is demodulated around the center_frequency of
+  the analysis window (using iq2). The slowly varying quadratures are
+  subsequently sent to the 2 channels of the scope. The complex IQ time trace
+  is built from the sum I(t) + iQ(t). The spectrum is then evaluated by
+  performing a Fourier transforom of the the complex iq signal.
+- baseband mode: up to 2 channels are available in baseband mode. The
+  channels are digitized by the scope and the real traces are directly Fourier
+  transformed. Since both channels are acquired simultaneously, it is also
+  possible to retrieve the cross spectrum between channel 1 and channel 2 (the
+  relative phase of the fourier transform coefficients is meaningful)
+
+At the moment, the iq mode is deactivated since we haven't yet implemented
+the sharp antialiasing filters required to avoid polluting the analysis
+windows from aliased noise originating from outside the Nyquist frequency of
+the scope acquisition. However, we are planning on implementing such a
+filter with the iir module in the near future.
+
+In the following example, we are going to demonstrate how to measure a
+sinusoidal signal and a white noise originating from an asg
+
+.. code :: python
+
+    # let's use a module manager for the asg
+    with p.asgs.pop('user') as asg:
+        # setup a sine at 100 kHz
+        asg.setup(frequency=1e5, waveform='sin', trigger_source='immediately', amplitude=1., offset=0)
+
+        # setup the spectrumanalyzer in baseband mode
+        p.spectrumanalyzer.setup(input1_baseband=asg, #note that input1_baseband!=input)
+                                 baseband=True, # only mod eavailable right now
+                                 span=1e6, # span of the analysis (/2 in iq mode)
+                                 window=blackman # filter window)
+
+        # the return format is (spectrum for channel 1, spectrum for channel 2,
+        # real part of cross spectrum, imaginary part of cross spectrum):
+        ch1, ch2, cross_re, cross_im = p.spectrumanalyzer.curve()
+
+    # plot the spectrum
+    import matplotlib.pyplot as plt
+    %matplotlib inline
+    plt.plot(p.spectrumanalyzer.frequencies, ch1)
+
+We notice that the spectrum is peaked around 100 kHz (The width of the peak
+is given by the residual bandwidth), and the height of the peak is 1.
+
+The internal unit of the spectrum analyzer is V_pk^2, such that a 1 V sine
+results in a 1 Vpk^2 peak in the spectrum. To convert the spectrum in units
+of noise spectral density, a utility function is provided: data_to_unit()
+
+.. code :: python
+
+    # let's use a module manager for the asg
+    with p.asgs.pop('user') as asg:
+        # setup a white noise of variance 0.1 V
+        asg.setup(frequency=1e5, waveform='noise', trigger_source='immediately', amplitude=0.1, offset=0)
+
+        # setup the spectrumanalyzer in baseband mode and full span
+        p.spectrumanalyzer.setup(input1_baseband=asg, baseband=True, span=125e6)
+
+        # the return format is (spectrum for channel 1, spectrum for channel 2,
+        # real part of cross spectrum, imaginary part of cross spectrum):
+        ch1, ch2, cross_re, cross_im = p.spectrumanalyzer.curve()
+
+    # convert to Vrms^2/Hz
+    data = p.spectrumanalyzer.data_to_unit(ch1, 'Vrms^2/Hz', p.spectrumanalyzer.rbw)
+
+    # plot the spectrum
+    import matplotlib.pyplot as plt
+    %matplotlib inline
+    plt.plot(p.spectrumanalyzer.frequencies, data)
+
+    # integrate spectrum from 0 to nyquist frequency
+    df = p.spectrumanalyzer.frequencies[1] - p.spectrumanalyzer.frequencies[0]
+    print(sum(data)*df)
+
+As expected, the integral of the noise spectrum over the whole frequency
+range gives the variance of the noise. To know more about spectrum analysis
+in Pyrpl, and in particular, how the filtering windows are normalized, please
+refer to the section :ref:`How a spectrum is computed in PyRPL`.
+"""
 
 import logging
 logger = logging.getLogger(name=__name__)
@@ -203,7 +288,8 @@ class SpectrumAnalyzer(AcquisitionModule):
              for s_time in Scope.sampling_times]
     spans = spans(nyquist_margin)
 
-    windows = ['blackman', 'flattop', 'boxcar', 'hamming']  # more can be
+    windows = ['blackman', 'flattop', 'boxcar', 'hamming', 'gaussian']  # more
+    # can be
     # added here (see http://docs.scipy.org/doc/scipy/reference/generated
     # /scipy.signal.get_window.html#scipy.signal.get_window)
     @property
@@ -306,7 +392,12 @@ class SpectrumAnalyzer(AcquisitionModule):
         """
         :return: filter window
         """
-        window = sig.get_window(self.window, self.data_length, fftbins=False)
+        if self.window=='gaussian':
+            #  a tuple with the std is needed for Gaussian window
+            window_name = ('gaussian', self.data_length/10)
+        else:
+            window_name = self.window
+        window = sig.get_window(window_name, self.data_length, fftbins=False)
         # empirical value for scaling flattop to sqrt(W)/V
         window/=(np.sum(window)/2)
         return window
@@ -315,7 +406,7 @@ class SpectrumAnalyzer(AcquisitionModule):
         """
         :return: complex iq time trace
         """
-        res = self.scope._get_curve()
+        res = self.scope._get_trace()
 
         if self.baseband:
             return res[0][:self.data_length] + 1j*res[1][:self.data_length]
@@ -352,7 +443,8 @@ class SpectrumAnalyzer(AcquisitionModule):
         In baseband, only half of the points are returned
         :return: the real number of points that will eventually be returned
         """
-        return self.points/2 if self.baseband else self.points
+        points = int(self.data_length * self.PADDING_FACTOR)
+        return points//2 + 1 if self.baseband else points
 
     @property
     def frequencies(self):
@@ -441,8 +533,11 @@ class SpectrumAnalyzer(AcquisitionModule):
             displaced_freqs = frequencies - self.center
         else:
             displaced_freqs = frequencies
-        norm_freq = self._scope_decimation()*displaced_freqs/125e6
-        return np.sinc(norm_freq)
+        if self._scope_decimation()>1:
+            norm_freq = self._scope_decimation()*displaced_freqs/125e6
+            return np.sinc(norm_freq)
+        else:
+            return np.ones(len(displaced_freqs))
 
     def transfer_function(self, frequencies):
         """
@@ -458,19 +553,24 @@ class SpectrumAnalyzer(AcquisitionModule):
     # Concrete implementation of AcquisitionModule methods
     # ----------------------------------------------------
 
-    @property
-    def data_x(self):
-        return self.frequencies
-
-    def _new_run_future(self):
-        # Redefined because a SpecAnRun needs to know its rbw
-        super(SpectrumAnalyzer, self)._new_run_future()
-        self._run_future.rbw = self.rbw
+    def _get_run_attributes(self):
+        params = super(SpectrumAnalyzer, self)._get_run_attributes()
+        params['rbw'] = self.rbw
+        return params
 
     def _free_up_resources(self):
         self.scope.free()
 
-    def _get_curve(self):
+    def _prepare_averaging(self):
+        super(SpectrumAnalyzer, self)._prepare_averaging()
+        self.current_avg = 0
+        if self.baseband:
+            self.data_avg = np.zeros((4, self._real_points))
+        else:
+            self.data_avg = np.zeros(self._real_points)
+        self.data_x = np.copy(self.frequencies)
+
+    def _get_trace(self):
         """
         No transfer_function correction
         :return:
@@ -495,9 +595,9 @@ class SpectrumAnalyzer(AcquisitionModule):
             # --> In fact, we will use numpy.rfft insead of
             # scipy.fftpack.rfft because the output
             # format is directly a complex array, and thus, easier to handle.
-            fft1 = np.fft.fftpack.rfft(np.real(iq_data),
+            fft1 = np.fft.rfft(np.real(iq_data),
                                        self.data_length*self.PADDING_FACTOR)
-            fft2 = np.fft.fftpack.rfft(np.imag(iq_data),
+            fft2 = np.fft.rfft(np.imag(iq_data),
                                        self.data_length*self.PADDING_FACTOR)
             cross_spectrum = np.conjugate(fft1)*fft2
 
@@ -545,12 +645,12 @@ class SpectrumAnalyzer(AcquisitionModule):
     def _scope_duration(self):
         return self._scope_decimation()*8e-9*self.data_length
 
-    def _start_acquisition(self):
+    def _start_trace_acquisition(self):
         autosave_backup = self._autosave_active
         # setup iq module
         if not self.baseband:
-            raise NotImplementedError("iq mode is not supported in the "
-                                      "current release of Pyrpl.")
+            #raise NotImplementedError("iq mode is not supported in the "
+            #                          "current release of Pyrpl.")
             self.iq.setup(
                 input = self.input,
                 bandwidth=self._iq_bandwidth(),
@@ -579,9 +679,9 @@ class SpectrumAnalyzer(AcquisitionModule):
                          trigger_source="immediately",
                          ch1_active=True,
                          ch2_active=True,
-                         rolling_mode=False,
-                         running_state='stopped')
-        return self.scope._start_acquisition()
+                         rolling_mode=False)
+        self.scope.stop()
+        return self.scope._start_trace_acquisition()
 
     def save_curve(self):
         """
@@ -593,7 +693,9 @@ class SpectrumAnalyzer(AcquisitionModule):
         the db_system. Also, returns the list [curve_ch1, curve_ch2]...
         """
         if not self.baseband:
-            return super(SpectrumAnalyzer, self)._save_curve()
+            return super(SpectrumAnalyzer, self)._save_curve(self.data_x,
+                                                  self.data_avg,
+                                                  **self.setup_attributes)
         else:
             d = self.setup_attributes
             curves = [None, None]
@@ -603,15 +705,15 @@ class SpectrumAnalyzer(AcquisitionModule):
                 if active:
                     d.update({'ch': ch,
                               'name': self.curve_name + ' ch' + str(ch + 1)})
-                    curves[ch] = self._save_curve(self._run_future.data_x,
-                                                  self._run_future.data_avg[ch],
+                    curves[ch] = self._save_curve(self.data_x,
+                                                  self.data_avg[ch],
                                                   **d)
             if self.display_cross_amplitude:
                 d.update({'ch': 'cross',
                           'name': self.curve_name + ' cross'})
-                curves.append(self._save_curve(self._run_future.data_x,
-                                              self._run_future.data_avg[2] +
-                                               1j*self._run_future.data_avg[3],
+                curves.append(self._save_curve(self.data_x,
+                                              self.data_avg[2] +
+                                               1j*self.data_avg[3],
                                               **d))
             return curves
 
